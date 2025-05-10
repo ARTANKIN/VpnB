@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 )
 
 // CryptoManager управляет шифрованием и дешифрованием данных
@@ -172,27 +173,24 @@ func (cm *CryptoManager) decryptGCM(ciphertext []byte) ([]byte, error) {
 		return nil, fmt.Errorf("ошибка создания шифра: %v", err)
 	}
 
-	// Создаем GCM
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка создания GCM: %v", err)
 	}
 
-	// Проверяем, что длина данных достаточна для nonce
 	if len(ciphertext) < gcm.NonceSize() {
 		return nil, errors.New("длина зашифрованных данных меньше размера nonce")
 	}
 
-	// Извлекаем nonce из начала данных
 	nonce := ciphertext[:gcm.NonceSize()]
 	ciphertext = ciphertext[gcm.NonceSize():]
 
-	// Дешифруем данные
 	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка дешифрования: %v", err)
 	}
 
+	log.Printf("Decryption successful. Nonce: %x, Decrypted size: %d", nonce, len(plaintext))
 	return plaintext, nil
 }
 

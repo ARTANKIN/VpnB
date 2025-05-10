@@ -2,121 +2,158 @@ package main
 
 import (
 	"VpnBlack/internal"
+	"encoding/binary"
 	"fmt"
+	"github.com/songgao/water"
 	"log"
 	"net"
-	"github.com/songgao/water"
+	"os/exec"
+	"sync"
 )
 
-//
-//import (
-//	"VpnBlack/internal"
-//	"fmt"
-//	"log"
-//	"net"
-//	"time"
-//)
-//
-//func main() {
-//	// Инициализация CryptoManager
-//	cryptoMgr, err := internal.NewCryptoManager(
-//		"32-char-key-for-AES-256-GCM-exam",
-//		"AES-256-GCM",
-//		"SHA256",
-//	)
-//	if err != nil {
-//		log.Fatal("CryptoManager error:", err)
-//	}
-//
-//	// Конфигурация туннеля
-//	config := internal.TunnelConfig{
-//		RemoteIP: "0.0.0.0",
-//		Port:     5555,
-//		Protocol: "udp",
-//		Cipher:   "AES-256-GCM",
-//		Auth:     "SHA256",
-//		Key:      "32-char-key-for-AES-256-GCM-example",
-//	}
-//
-//	// Инициализация менеджеров
-//	tunnelManager := internal.NewTunnelManager(cryptoMgr)
-//	tunnelManager.Initialize(config)
-//
-//	// Запуск UDP сервера
-//	addr, _ := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", config.Port))
-//	conn, err := net.ListenUDP("udp", addr)
-//	if err != nil {
-//		log.Fatal("Listen error:", err)
-//	}
-//	defer conn.Close()
-//
-//	fmt.Println("Server started on port", config.Port)
-//
-//	buffer := make([]byte, 4096)
-//	for {
-//		n, clientAddr, err := conn.ReadFromUDP(buffer)
-//		if err != nil {
-//			log.Println("Read error:", err)
-//			continue
-//		}
-//
-//		go handleClient(conn, clientAddr, buffer[:n], tunnelManager)
-//	}
-//}
-//
-//func handleClient(conn *net.UDPConn, addr *net.UDPAddr, data []byte, tm *internal.TunnelManager) {
-//	// Дешифровка данных
-//	decrypted, err := tm.CryptoMgr.Decrypt(data)
-//	if err != nil {
-//		log.Println("Decryption error:", err)
-//		return
-//	}
-//
-//	log.Printf("Received from %s: %s\n", addr.String(), string(decrypted))
-//
-//	// Формирование ответа
-//	response := fmt.Sprintf("ACK: %s | %s", time.Now().Format(time.RFC3339), string(decrypted))
-//
-//	// Шифровка ответа
-//	encrypted, err := tm.CryptoMgr.Encrypt([]byte(response))
-//	if err != nil {
-//		log.Println("Encryption error:", err)
-//		return
-//	}
-//
-//	// Отправка ответа
-//	_, err = conn.WriteToUDP(encrypted, addr)
-//	if err != nil {
-//		log.Println("Write error:", err)
-//		return
-//	}
-//
-//	log.Printf("Sent to %s: %s\n", addr.String(), response)
-//}
+type VPNServer struct {
+	cryptoMgr     *internal.CryptoManager
+	tunnelManager *internal.TunnelManager
+	tunInterface  *water.Interface
+	udpConn       *net.UDPConn
+	clients       sync.Map
+	config        internal.TunnelConfig
+}
 
-package main
+func parseIPv4Packet(packet []byte) {
+	if len(packet) < 20 {
+		log.Println("Packet too short")
+		return
+	}
 
-import (
-	"fmt"
-	"log"
-	"net"
-	"github.com/songgao/water"
-	"internal" // Ваш пакет
-)
+	// Версия и длина заголовка
+	version := packet[0] >> 4
+	headerLength := (packet[0] & 0x0F) * 4
 
-func main() {
-	// Инициализация CryptoManager
+	// Тип сервиса
+	typeOfService := packet[1]
+
+	// Общая длина пакета
+	totalLength := binary.BigEndian.Uint16(packet[2:4])
+
+	// Идентификатор пакета
+	identification := binary.BigEndian.Uint16(packet[4:6])
+
+	// Флаги и смещение фрагмента
+	flags := packet[6] >> 5
+	fragmentOffset := binary.BigEndian.Uint16(packet[6:8]) & 0x1FFF
+
+	// Время жизни (TTL)
+	ttl := packet[8]
+
+	// Протокол
+	protocol := packet[9]
+
+	// Контрольная сумма заголовка
+	headerChecksum := binary.BigEndian.Uint16(packet[10:12])
+
+	// IP-адрес источника
+	sourceIP := net.IP(packet[12:16])
+
+	// IP-адрес назначения
+	destIP := net.IP(packet[16:20])
+
+	// Вывод информации
+	log.Printf("IPv4 Packet Details:")
+	log.Printf("Version: %d", version)
+	log.Printf("Header Length: %d bytes", headerLength)
+	log.Printf("Type of Service: 0x%02x", typeOfService)
+	log.Printf("Total Length: %d", totalLength)
+	log.Printf("Identification: %d", identification)
+	log.Printf("Flags: 0x%02x", flags)
+	log.Printf("Fragment Offset: %d", fragmentOffset)
+	log.Printf("TTL: %d", ttl)
+	log.Printf("Protocol: %d", protocol)
+	log.Printf("Header Checksum: 0x%04x", headerChecksum)
+	log.Printf("Source IP: %s", sourceIP)
+	log.Printf("Destination IP: %s", destIP)
+
+	// Парсинг протокола
+	switch protocol {
+	case 1: // ICMP
+		parseICMPPacket(packet[headerLength:])
+	case 6: // TCP
+		parseTCPPacket(packet[headerLength:])
+	case 17: // UDP
+		parseUDPPacket(packet[headerLength:])
+	default:
+		log.Printf("Unknown protocol: %d", protocol)
+	}
+}
+
+func parseICMPPacket(payload []byte) {
+	if len(payload) < 8 {
+		log.Println("ICMP packet too short")
+		return
+	}
+
+	icmpType := payload[0]
+	icmpCode := payload[1]
+	icmpChecksum := binary.BigEndian.Uint16(payload[2:4])
+
+	log.Printf("ICMP Packet:")
+	log.Printf("Type: %d", icmpType)
+	log.Printf("Code: %d", icmpCode)
+	log.Printf("Checksum: 0x%04x", icmpChecksum)
+}
+
+func parseTCPPacket(payload []byte) {
+	if len(payload) < 20 {
+		log.Println("TCP packet too short")
+		return
+	}
+
+	sourcePort := binary.BigEndian.Uint16(payload[0:2])
+	destPort := binary.BigEndian.Uint16(payload[2:4])
+	sequenceNumber := binary.BigEndian.Uint32(payload[4:8])
+	acknowledgmentNumber := binary.BigEndian.Uint32(payload[8:12])
+	dataOffset := payload[12] >> 4
+	flags := payload[13]
+
+	log.Printf("TCP Packet:")
+	log.Printf("Source Port: %d", sourcePort)
+	log.Printf("Destination Port: %d", destPort)
+	log.Printf("Sequence Number: %d", sequenceNumber)
+	log.Printf("Acknowledgment Number: %d", acknowledgmentNumber)
+	log.Printf("Data Offset: %d bytes", dataOffset*4)
+	log.Printf("Flags: 0x%02x", flags)
+}
+
+func parseUDPPacket(payload []byte) {
+	if len(payload) < 8 {
+		log.Println("UDP packet too short")
+		return
+	}
+
+	sourcePort := binary.BigEndian.Uint16(payload[0:2])
+	destPort := binary.BigEndian.Uint16(payload[2:4])
+	length := binary.BigEndian.Uint16(payload[4:6])
+	checksum := binary.BigEndian.Uint16(payload[6:8])
+
+	log.Printf("UDP Packet:")
+	log.Printf("Source Port: %d", sourcePort)
+	log.Printf("Destination Port: %d", destPort)
+	log.Printf("Length: %d", length)
+	log.Printf("Checksum: 0x%04x", checksum)
+}
+
+func NewVPNServer() (*VPNServer, error) {
 	cryptoMgr, err := internal.NewCryptoManager(
 		"32-char-key-for-AES-256-GCM-exam",
 		"AES-256-GCM",
 		"SHA256",
 	)
 	if err != nil {
-		log.Fatal("CryptoManager error:", err)
+		return nil, fmt.Errorf("crypto manager init error: %v", err)
 	}
 
-	// Конфигурация туннеля
 	config := internal.TunnelConfig{
+		LocalIP:  "10.0.0.1",
 		RemoteIP: "0.0.0.0",
 		Port:     5555,
 		Protocol: "udp",
@@ -125,90 +162,162 @@ func main() {
 		Key:      "32-char-key-for-AES-256-GCM-exam",
 	}
 
-	// Инициализация TunnelManager
 	tunnelManager := internal.NewTunnelManager(cryptoMgr)
-	tunnelManager.Initialize(config)
+	err = tunnelManager.Initialize(config)
+	if err != nil {
+		return nil, fmt.Errorf("tunnel manager init error: %v", err)
+	}
 
-	// Создание TUN-интерфейса
+	return &VPNServer{
+		cryptoMgr:     cryptoMgr,
+		tunnelManager: tunnelManager,
+		config:        config,
+		clients:       sync.Map{},
+	}, nil
+}
+
+func (s *VPNServer) initTunInterface() error {
 	tunConfig := water.Config{
 		DeviceType: water.TUN,
+		PlatformSpecificParams: water.PlatformSpecificParams{
+			Name: "utun6",
+		},
 	}
-	tunIface, err := water.New(tunConfig)
+	iface, err := water.New(tunConfig)
 	if err != nil {
-		log.Fatal("TUN interface error:", err)
+		return fmt.Errorf("tun interface creation error: %v", err)
 	}
-	defer tunIface.Close()
+	s.tunInterface = iface
 
-	// Настройка IP для TUN-интерфейса (требуется системная команда)
-	// Например: exec.Command("ifconfig", tunIface.Name(), "10.0.0.1/24", "up").Run()
-	log.Printf("TUN interface created: %s", tunIface.Name())
+	cmds := [][]string{
+		{"ifconfig", iface.Name(), "10.0.0.1", "10.0.0.2", "up"},
+		{"route", "-n", "add", "-net", "10.0.0.0/24", "-interface", iface.Name()},
+		{"sysctl", "-w", "net.inet.ip.forwarding=1"},
+		// Add NAT rules for internet access
+		{"pfctl", "-e"}, // Enable packet filter
+		{"echo", "'nat on en0 from 10.0.0.0/24 to any -> (en0)' | pfctl -f -"}, // Replace en0 with your Mac's internet interface
+	}
 
-	// Включение IP-форвардинга (требуется на сервере)
-	// Например: exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run()
+	for _, cmdArgs := range cmds {
+		cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
+		if err := cmd.Run(); err != nil {
+			log.Printf("Warning: command %v error: %v", cmdArgs, err)
+		}
+	}
 
-	// Запуск UDP-сервера
-	addr, _ := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", config.Port))
+	log.Printf("TUN interface created: %s", iface.Name())
+	return nil
+
+	log.Printf("TUN interface created: %s", iface.Name())
+	return nil
+}
+
+func (s *VPNServer) initUDPServer() error {
+	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", s.config.Port))
+	if err != nil {
+		return fmt.Errorf("resolve udp addr error: %v", err)
+	}
+
 	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
-		log.Fatal("Listen error:", err)
+		return fmt.Errorf("udp listen error: %v", err)
 	}
-	defer conn.Close()
+	s.udpConn = conn
+	log.Printf("UDP Server started on port %d", s.config.Port)
+	return nil
+}
 
-	fmt.Println("Server started on port", config.Port)
-
-	// Запуск маршрутизации ответов из TUN
-	go routeTraffic(tunIface, conn)
-
-	// Обработка входящих данных от клиентов
+func (s *VPNServer) handleIncomingPackets() {
 	buffer := make([]byte, 4096)
 	for {
-		n, clientAddr, err := conn.ReadFromUDP(buffer)
+		n, clientAddr, err := s.udpConn.ReadFromUDP(buffer)
 		if err != nil {
-			log.Println("Read error:", err)
+			log.Printf("UDP read error: %v", err)
 			continue
 		}
-		go handleClient(conn, clientAddr, buffer[:n], cryptoMgr, tunIface)
+
+		s.clients.Store(clientAddr.String(), clientAddr)
+		go s.processClientPacket(clientAddr, buffer[:n])
 	}
 }
 
-func handleClient(conn *net.UDPConn, addr *net.UDPAddr, data []byte, cryptoMgr *internal.CryptoManager, tunIface *water.Interface) {
-	// Дешифровка данных
-	decrypted, err := cryptoMgr.Decrypt(data)
+func (s *VPNServer) processClientPacket(clientAddr *net.UDPAddr, data []byte) {
+	decrypted, err := s.cryptoMgr.Decrypt(data)
 	if err != nil {
-		log.Println("Decryption error:", err)
+		log.Printf("Decryption error from %s: %v", clientAddr, err)
 		return
 	}
 
-	// Запись пакета в TUN-интерфейс (маршрутизация в интернет)
-	_, err = tunIface.Write(decrypted)
+	// Проверка, что это IPv4 пакет
+	if decrypted[0]>>4 != 4 {
+		log.Printf("Not an IPv4 packet from %s", clientAddr)
+		return
+	}
+
+	// Парсинг пакета
+	parseIPv4Packet(decrypted)
+
+	_, err = s.tunInterface.Write(decrypted)
 	if err != nil {
-		log.Println("Write to TUN error:", err)
+		log.Printf("Write to TUN error: %v", err)
 	}
 }
 
-func routeTraffic(tunIface *water.Interface, conn *net.UDPConn) {
+func (s *VPNServer) routeTunnelTraffic() {
 	buffer := make([]byte, 4096)
 	for {
-		n, err := tunIface.Read(buffer)
+		n, err := s.tunInterface.Read(buffer)
 		if err != nil {
-			log.Println("Read from TUN error:", err)
+			log.Printf("Read from TUN error: %v", err)
 			continue
 		}
 
-		// Шифрование данных перед отправкой клиенту
-		encrypted, err := cryptoMgr.Encrypt(buffer[:n])
-		if err != nil {
-			log.Println("Encryption error:", err)
+		if !isValidPacket(buffer[:n]) {
 			continue
 		}
 
-		// Отправка данных клиенту
-		// Здесь нужно хранить адреса клиентов (например, в map)
-		// Для простоты предполагаем одного клиента
-		clientAddr, _ := net.ResolveUDPAddr("udp", "client_ip:client_port") // Замените на реальный адрес
-		_, err = conn.WriteToUDP(encrypted, clientAddr)
+		encrypted, err := s.cryptoMgr.Encrypt(buffer[:n])
 		if err != nil {
-			log.Println("Write to client error:", err)
+			log.Printf("Encryption error: %v", err)
+			continue
 		}
+
+		s.clients.Range(func(key, value interface{}) bool {
+			clientAddr := value.(*net.UDPAddr)
+			_, err = s.udpConn.WriteToUDP(encrypted, clientAddr)
+			if err != nil {
+				log.Printf("Write to %s error: %v", clientAddr, err)
+			}
+			return true
+		})
 	}
+}
+
+func isValidPacket(packet []byte) bool {
+	if len(packet) < 20 {
+		return false
+	}
+	return (packet[0] >> 4) == 4
+}
+
+func main() {
+	internal.StartAPIServer()
+	server, err := NewVPNServer()
+	if err != nil {
+		log.Fatalf("Server initialization error: %v", err)
+	}
+	err = server.initTunInterface()
+	if err != nil {
+		log.Fatalf("TUN interface error: %v", err)
+	}
+	defer server.tunInterface.Close()
+
+	err = server.initUDPServer()
+	if err != nil {
+		log.Fatalf("UDP server error: %v", err)
+	}
+	defer server.udpConn.Close()
+
+	go server.handleIncomingPackets()
+	server.routeTunnelTraffic()
 }

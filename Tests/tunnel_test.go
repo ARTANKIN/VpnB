@@ -110,11 +110,10 @@ func TestTunnelManager_SendReceiveData(t *testing.T) {
 		t.Fatalf("Start failed: %v", err)
 	}
 
-	// Тестовые данные
 	testData := []byte("test data")
 
 	// Отправка данных через туннель
-	err = tm.SendData(testData)
+	_, err = tm.SendData(testData)
 	if err != nil {
 		t.Fatalf("SendData failed: %v", err)
 	}
