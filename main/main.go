@@ -3,21 +3,31 @@ package main
 import (
 	"VpnBlack/internal"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"github.com/songgao/water"
 	"log"
 	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"os/exec"
 	"sync"
 )
 
+type AuthPacket struct {
+	Type  string `json:"type"`
+	Token string `json:"token"`
+	Data  []byte `json:"data,omitempty"`
+}
+
 type VPNServer struct {
-	cryptoMgr     *internal.CryptoManager
-	tunnelManager *internal.TunnelManager
-	tunInterface  *water.Interface
-	udpConn       *net.UDPConn
-	clients       sync.Map
-	config        internal.TunnelConfig
+	cryptoMgr         *internal.CryptoManager
+	tunnelManager     *internal.TunnelManager
+	tunInterface      *water.Interface
+	udpConn           *net.UDPConn
+	clients           sync.Map
+	authorizedClients sync.Map
+	config            internal.TunnelConfig
 }
 
 func parseIPv4Packet(packet []byte) {
@@ -26,39 +36,19 @@ func parseIPv4Packet(packet []byte) {
 		return
 	}
 
-	// Версия и длина заголовка
 	version := packet[0] >> 4
 	headerLength := (packet[0] & 0x0F) * 4
-
-	// Тип сервиса
 	typeOfService := packet[1]
-
-	// Общая длина пакета
 	totalLength := binary.BigEndian.Uint16(packet[2:4])
-
-	// Идентификатор пакета
 	identification := binary.BigEndian.Uint16(packet[4:6])
-
-	// Флаги и смещение фрагмента
 	flags := packet[6] >> 5
 	fragmentOffset := binary.BigEndian.Uint16(packet[6:8]) & 0x1FFF
-
-	// Время жизни (TTL)
 	ttl := packet[8]
-
-	// Протокол
 	protocol := packet[9]
-
-	// Контрольная сумма заголовка
 	headerChecksum := binary.BigEndian.Uint16(packet[10:12])
-
-	// IP-адрес источника
 	sourceIP := net.IP(packet[12:16])
-
-	// IP-адрес назначения
 	destIP := net.IP(packet[16:20])
 
-	// Вывод информации
 	log.Printf("IPv4 Packet Details:")
 	log.Printf("Version: %d", version)
 	log.Printf("Header Length: %d bytes", headerLength)
@@ -73,7 +63,6 @@ func parseIPv4Packet(packet []byte) {
 	log.Printf("Source IP: %s", sourceIP)
 	log.Printf("Destination IP: %s", destIP)
 
-	// Парсинг протокола
 	switch protocol {
 	case 1: // ICMP
 		parseICMPPacket(packet[headerLength:])
@@ -169,10 +158,11 @@ func NewVPNServer() (*VPNServer, error) {
 	}
 
 	return &VPNServer{
-		cryptoMgr:     cryptoMgr,
-		tunnelManager: tunnelManager,
-		config:        config,
-		clients:       sync.Map{},
+		cryptoMgr:         cryptoMgr,
+		tunnelManager:     tunnelManager,
+		config:            config,
+		clients:           sync.Map{},
+		authorizedClients: sync.Map{},
 	}, nil
 }
 
@@ -193,9 +183,8 @@ func (s *VPNServer) initTunInterface() error {
 		{"ifconfig", iface.Name(), "10.0.0.1", "10.0.0.2", "up"},
 		{"route", "-n", "add", "-net", "10.0.0.0/24", "-interface", iface.Name()},
 		{"sysctl", "-w", "net.inet.ip.forwarding=1"},
-		// Add NAT rules for internet access
-		{"pfctl", "-e"}, // Enable packet filter
-		{"echo", "'nat on en0 from 10.0.0.0/24 to any -> (en0)' | pfctl -f -"}, // Replace en0 with your Mac's internet interface
+		{"pfctl", "-e"},
+		{"echo", "'nat on en0 from 10.0.0.0/24 to any -> (en0)' | pfctl -f -"},
 	}
 
 	for _, cmdArgs := range cmds {
@@ -204,9 +193,6 @@ func (s *VPNServer) initTunInterface() error {
 			log.Printf("Warning: command %v error: %v", cmdArgs, err)
 		}
 	}
-
-	log.Printf("TUN interface created: %s", iface.Name())
-	return nil
 
 	log.Printf("TUN interface created: %s", iface.Name())
 	return nil
@@ -227,6 +213,14 @@ func (s *VPNServer) initUDPServer() error {
 	return nil
 }
 
+func (s *VPNServer) extractTokenFromPacket(data []byte) (string, []byte, error) {
+	var authPacket AuthPacket
+	err := json.Unmarshal(data, &authPacket)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to parse auth packet: %v", err)
+	}
+	return authPacket.Token, authPacket.Data, nil
+}
 func (s *VPNServer) handleIncomingPackets() {
 	buffer := make([]byte, 4096)
 	for {
@@ -235,31 +229,81 @@ func (s *VPNServer) handleIncomingPackets() {
 			log.Printf("UDP read error: %v", err)
 			continue
 		}
+		//log.Printf("Received data from %s, length: %d, raw: %s", clientAddr.String(), n, string(buffer[:n]))
 
-		s.clients.Store(clientAddr.String(), clientAddr)
-		go s.processClientPacket(clientAddr, buffer[:n])
+		// Attempt to parse as JSON auth packet
+		var authPacket AuthPacket
+		if err := json.Unmarshal(buffer[:n], &authPacket); err == nil && authPacket.Type == "auth" {
+			log.Printf("Processing auth packet from %s, token: %s", clientAddr, authPacket.Token)
+			claims, err := internal.ValidateJWTToken(authPacket.Token)
+			if err != nil {
+				log.Printf("Invalid token from %s: %v", clientAddr, err)
+				response := AuthPacket{
+					Type:  "auth_response",
+					Token: "failed",
+				}
+				responseData, _ := json.Marshal(response)
+				_, err := s.udpConn.WriteToUDP(responseData, clientAddr)
+				if err != nil {
+					log.Printf("Failed to send auth failure response to %s: %v", clientAddr, err)
+				}
+				continue
+			}
+
+			s.authorizedClients.Store(clientAddr.String(), claims.Username)
+			s.clients.Store(clientAddr.String(), clientAddr)
+
+			response := AuthPacket{
+				Type:  "auth_response",
+				Token: "success",
+			}
+			responseData, _ := json.Marshal(response)
+			_, err = s.udpConn.WriteToUDP(responseData, clientAddr)
+			if err != nil {
+				log.Printf("Failed to send auth success response to %s: %v", clientAddr, err)
+			} else {
+				log.Printf("Sent auth success response to %s", clientAddr)
+			}
+
+			log.Printf("Client authenticated: %s (%s)", clientAddr, claims.Username)
+			continue
+		}
+
+		// Check if client is authorized
+		username, authorized := s.authorizedClients.Load(clientAddr.String())
+		if !authorized {
+			log.Printf("Unauthorized client: %s", clientAddr)
+			continue
+		}
+
+		go s.processClientPacket(clientAddr, buffer[:n], username.(string))
 	}
 }
 
-func (s *VPNServer) processClientPacket(clientAddr *net.UDPAddr, data []byte) {
+func (s *VPNServer) processClientPacket(clientAddr *net.UDPAddr, data []byte, username string) {
 	decrypted, err := s.cryptoMgr.Decrypt(data)
 	if err != nil {
 		log.Printf("Decryption error from %s: %v", clientAddr, err)
 		return
 	}
 
-	// Проверка, что это IPv4 пакет
-	if decrypted[0]>>4 != 4 {
-		log.Printf("Not an IPv4 packet from %s", clientAddr)
+	// Проверка на минимальный размер IPv4 пакета
+	if len(decrypted) < 20 {
+		log.Printf("Packet too small from %s", clientAddr)
 		return
 	}
 
-	// Парсинг пакета
-	parseIPv4Packet(decrypted)
+	// Проверка версии IP
+	version := decrypted[0] >> 4
+	if version != 4 {
+		log.Printf("Not an IPv4 packet from %s (version: %d)", clientAddr, version)
+		return
+	}
 
 	_, err = s.tunInterface.Write(decrypted)
 	if err != nil {
 		log.Printf("Write to TUN error: %v", err)
+		return
 	}
 }
 
@@ -301,11 +345,16 @@ func isValidPacket(packet []byte) bool {
 }
 
 func main() {
-	internal.StartAPIServer()
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
+	go internal.StartAPIServer()
+
 	server, err := NewVPNServer()
 	if err != nil {
 		log.Fatalf("Server initialization error: %v", err)
 	}
+
 	err = server.initTunInterface()
 	if err != nil {
 		log.Fatalf("TUN interface error: %v", err)
