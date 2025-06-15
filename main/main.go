@@ -2,7 +2,6 @@ package main
 
 import (
 	"VpnBlack/internal"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"github.com/songgao/water"
@@ -20,6 +19,35 @@ type AuthPacket struct {
 	Data  []byte `json:"data,omitempty"`
 }
 
+type ClientInfo struct {
+	Addr     *net.UDPAddr
+	Username string
+}
+
+type WorkerPool struct {
+	tasks chan func()
+}
+
+func NewWorkerPool(numWorkers int, bufferSize int) *WorkerPool {
+	wp := &WorkerPool{
+		tasks: make(chan func(), bufferSize),
+	}
+	for i := 0; i < numWorkers; i++ {
+		go wp.worker()
+	}
+	return wp
+}
+
+func (wp *WorkerPool) worker() {
+	for task := range wp.tasks {
+		task()
+	}
+}
+
+func (wp *WorkerPool) Submit(task func()) {
+	wp.tasks <- task
+}
+
 type VPNServer struct {
 	cryptoMgr         *internal.CryptoManager
 	tunnelManager     *internal.TunnelManager
@@ -28,107 +56,7 @@ type VPNServer struct {
 	clients           sync.Map
 	authorizedClients sync.Map
 	config            internal.TunnelConfig
-}
-
-func parseIPv4Packet(packet []byte) {
-	if len(packet) < 20 {
-		log.Println("Packet too short")
-		return
-	}
-
-	version := packet[0] >> 4
-	headerLength := (packet[0] & 0x0F) * 4
-	typeOfService := packet[1]
-	totalLength := binary.BigEndian.Uint16(packet[2:4])
-	identification := binary.BigEndian.Uint16(packet[4:6])
-	flags := packet[6] >> 5
-	fragmentOffset := binary.BigEndian.Uint16(packet[6:8]) & 0x1FFF
-	ttl := packet[8]
-	protocol := packet[9]
-	headerChecksum := binary.BigEndian.Uint16(packet[10:12])
-	sourceIP := net.IP(packet[12:16])
-	destIP := net.IP(packet[16:20])
-
-	log.Printf("IPv4 Packet Details:")
-	log.Printf("Version: %d", version)
-	log.Printf("Header Length: %d bytes", headerLength)
-	log.Printf("Type of Service: 0x%02x", typeOfService)
-	log.Printf("Total Length: %d", totalLength)
-	log.Printf("Identification: %d", identification)
-	log.Printf("Flags: 0x%02x", flags)
-	log.Printf("Fragment Offset: %d", fragmentOffset)
-	log.Printf("TTL: %d", ttl)
-	log.Printf("Protocol: %d", protocol)
-	log.Printf("Header Checksum: 0x%04x", headerChecksum)
-	log.Printf("Source IP: %s", sourceIP)
-	log.Printf("Destination IP: %s", destIP)
-
-	switch protocol {
-	case 1: // ICMP
-		parseICMPPacket(packet[headerLength:])
-	case 6: // TCP
-		parseTCPPacket(packet[headerLength:])
-	case 17: // UDP
-		parseUDPPacket(packet[headerLength:])
-	default:
-		log.Printf("Unknown protocol: %d", protocol)
-	}
-}
-
-func parseICMPPacket(payload []byte) {
-	if len(payload) < 8 {
-		log.Println("ICMP packet too short")
-		return
-	}
-
-	icmpType := payload[0]
-	icmpCode := payload[1]
-	icmpChecksum := binary.BigEndian.Uint16(payload[2:4])
-
-	log.Printf("ICMP Packet:")
-	log.Printf("Type: %d", icmpType)
-	log.Printf("Code: %d", icmpCode)
-	log.Printf("Checksum: 0x%04x", icmpChecksum)
-}
-
-func parseTCPPacket(payload []byte) {
-	if len(payload) < 20 {
-		log.Println("TCP packet too short")
-		return
-	}
-
-	sourcePort := binary.BigEndian.Uint16(payload[0:2])
-	destPort := binary.BigEndian.Uint16(payload[2:4])
-	sequenceNumber := binary.BigEndian.Uint32(payload[4:8])
-	acknowledgmentNumber := binary.BigEndian.Uint32(payload[8:12])
-	dataOffset := payload[12] >> 4
-	flags := payload[13]
-
-	log.Printf("TCP Packet:")
-	log.Printf("Source Port: %d", sourcePort)
-	log.Printf("Destination Port: %d", destPort)
-	log.Printf("Sequence Number: %d", sequenceNumber)
-	log.Printf("Acknowledgment Number: %d", acknowledgmentNumber)
-	log.Printf("Data Offset: %d bytes", dataOffset*4)
-	log.Printf("Flags: 0x%02x", flags)
-}
-
-func parseUDPPacket(payload []byte) {
-	if len(payload) < 8 {
-		log.Println("UDP packet too short")
-		return
-	}
-
-	sourcePort := binary.BigEndian.Uint16(payload[0:2])
-	destPort := binary.BigEndian.Uint16(payload[2:4])
-	length := binary.BigEndian.Uint16(payload[4:6])
-	checksum := binary.BigEndian.Uint16(payload[6:8])
-
-	log.Printf("UDP Packet:")
-	log.Printf("Source Port: %d", sourcePort)
-	log.Printf("Destination Port: %d", destPort)
-	log.Printf("Length: %d", length)
-	log.Printf("Checksum: 0x%04x", checksum)
+	workerPool        *WorkerPool
 }
 
 func NewVPNServer() (*VPNServer, error) {
@@ -157,12 +85,16 @@ func NewVPNServer() (*VPNServer, error) {
 		return nil, fmt.Errorf("tunnel manager init error: %v", err)
 	}
 
+	// Создаем пул воркеров с 10 рабочими и буфером на 1000 задач
+	workerPool := NewWorkerPool(10, 1000)
+
 	return &VPNServer{
 		cryptoMgr:         cryptoMgr,
 		tunnelManager:     tunnelManager,
 		config:            config,
 		clients:           sync.Map{},
 		authorizedClients: sync.Map{},
+		workerPool:        workerPool,
 	}, nil
 }
 
@@ -213,14 +145,6 @@ func (s *VPNServer) initUDPServer() error {
 	return nil
 }
 
-func (s *VPNServer) extractTokenFromPacket(data []byte) (string, []byte, error) {
-	var authPacket AuthPacket
-	err := json.Unmarshal(data, &authPacket)
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to parse auth packet: %v", err)
-	}
-	return authPacket.Token, authPacket.Data, nil
-}
 func (s *VPNServer) handleIncomingPackets() {
 	buffer := make([]byte, 4096)
 	for {
@@ -229,12 +153,15 @@ func (s *VPNServer) handleIncomingPackets() {
 			log.Printf("UDP read error: %v", err)
 			continue
 		}
-		//log.Printf("Received data from %s, length: %d, raw: %s", clientAddr.String(), n, string(buffer[:n]))
 
-		// Attempt to parse as JSON auth packet
+		// Копируем данные, чтобы избежать перезаписи буфера
+		dataCopy := make([]byte, n)
+		copy(dataCopy, buffer[:n])
+
+		// Проверяем, является ли это пакетом авторизации
 		var authPacket AuthPacket
-		if err := json.Unmarshal(buffer[:n], &authPacket); err == nil && authPacket.Type == "auth" {
-			log.Printf("Processing auth packet from %s, token: %s", clientAddr, authPacket.Token)
+		if err := json.Unmarshal(dataCopy, &authPacket); err == nil && authPacket.Type == "auth" {
+			log.Printf("Processing auth packet from %s", clientAddr)
 			claims, err := internal.ValidateJWTToken(authPacket.Token)
 			if err != nil {
 				log.Printf("Invalid token from %s: %v", clientAddr, err)
@@ -250,8 +177,13 @@ func (s *VPNServer) handleIncomingPackets() {
 				continue
 			}
 
+			// Сохраняем информацию о клиенте
+			clientInfo := &ClientInfo{
+				Addr:     clientAddr,
+				Username: claims.Username,
+			}
 			s.authorizedClients.Store(clientAddr.String(), claims.Username)
-			s.clients.Store(clientAddr.String(), clientAddr)
+			s.clients.Store(clientAddr.String(), clientInfo)
 
 			response := AuthPacket{
 				Type:  "auth_response",
@@ -262,21 +194,22 @@ func (s *VPNServer) handleIncomingPackets() {
 			if err != nil {
 				log.Printf("Failed to send auth success response to %s: %v", clientAddr, err)
 			} else {
-				log.Printf("Sent auth success response to %s", clientAddr)
+				log.Printf("Client authenticated: %s (%s)", clientAddr, claims.Username)
 			}
-
-			log.Printf("Client authenticated: %s (%s)", clientAddr, claims.Username)
 			continue
 		}
 
-		// Check if client is authorized
+		// Проверяем авторизацию клиента
 		username, authorized := s.authorizedClients.Load(clientAddr.String())
 		if !authorized {
 			log.Printf("Unauthorized client: %s", clientAddr)
 			continue
 		}
 
-		go s.processClientPacket(clientAddr, buffer[:n], username.(string))
+		// Отправляем задачу в пул воркеров
+		s.workerPool.Submit(func() {
+			s.processClientPacket(clientAddr, dataCopy, username.(string))
+		})
 	}
 }
 
@@ -287,13 +220,11 @@ func (s *VPNServer) processClientPacket(clientAddr *net.UDPAddr, data []byte, us
 		return
 	}
 
-	// Проверка на минимальный размер IPv4 пакета
 	if len(decrypted) < 20 {
 		log.Printf("Packet too small from %s", clientAddr)
 		return
 	}
 
-	// Проверка версии IP
 	version := decrypted[0] >> 4
 	if version != 4 {
 		log.Printf("Not an IPv4 packet from %s (version: %d)", clientAddr, version)
@@ -303,7 +234,6 @@ func (s *VPNServer) processClientPacket(clientAddr *net.UDPAddr, data []byte, us
 	_, err = s.tunInterface.Write(decrypted)
 	if err != nil {
 		log.Printf("Write to TUN error: %v", err)
-		return
 	}
 }
 
@@ -326,11 +256,14 @@ func (s *VPNServer) routeTunnelTraffic() {
 			continue
 		}
 
+		// Отправляем данные всем клиентам (можно оптимизировать маршрутизацию по IP)
 		s.clients.Range(func(key, value interface{}) bool {
-			clientAddr := value.(*net.UDPAddr)
-			_, err = s.udpConn.WriteToUDP(encrypted, clientAddr)
+			clientInfo := value.(*ClientInfo)
+			_, err = s.udpConn.WriteToUDP(encrypted, clientInfo.Addr)
 			if err != nil {
-				log.Printf("Write to %s error: %v", clientAddr, err)
+				log.Printf("Write to %s error: %v", clientInfo.Addr, err)
+			} else {
+				log.Printf("Sent %d bytes to %s", len(encrypted), clientInfo.Addr)
 			}
 			return true
 		})
